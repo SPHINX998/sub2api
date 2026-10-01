@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,12 +65,17 @@ const compatPartialMessageStartSSE = "event: message_start\ndata: {\"type\":\"me
 
 // Streams through the Chat Completions and Responses compatibility entries on
 // an Anthropic account must persist the upstream-metered usage exactly once
-// whether the stream completes, is truncated, or the client left first.
+// whether the stream completes, is truncated, or the client left first. The
+// buffered/ variants serve a non-streaming client from the same upstream
+// stream, which must never receive a truncated answer as a success.
 func TestGatewayCompatibleHandlersPreservePartialUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, endpoint := range []string{"chat/completions", "responses"} {
-		for _, ending := range []string{"complete", "truncated", "disconnected_truncated", "before_start"} {
+		for _, ending := range []string{"complete", "truncated", "disconnected_truncated", "before_start",
+			"buffered/complete", "buffered/truncated", "buffered/disconnected_truncated", "buffered/before_start"} {
 			t.Run(endpoint+"/"+ending, func(t *testing.T) {
+				clientStream := !strings.HasPrefix(ending, "buffered/")
+				ending := strings.TrimPrefix(ending, "buffered/")
 				groupID := int64(9200)
 				group := &service.Group{ID: groupID, Hydrated: true, Platform: service.PlatformAnthropic, Status: service.StatusActive, RateMultiplier: 1}
 				account := &service.Account{
@@ -109,9 +115,9 @@ func TestGatewayCompatibleHandlersPreservePartialUsage(t *testing.T) {
 				}
 				apiKey := &service.APIKey{ID: 9202, UserID: 9203, GroupID: &groupID, Group: group, Status: service.StatusActive,
 					User: &service.User{ID: 9203, Concurrency: 10, Balance: 100}}
-				body := `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":true}`
+				body := fmt.Sprintf(`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":%t}`, clientStream)
 				if endpoint == "responses" {
-					body = `{"model":"claude-sonnet-4-5","input":"hello","stream":true}`
+					body = fmt.Sprintf(`{"model":"claude-sonnet-4-5","input":"hello","stream":%t}`, clientStream)
 				}
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
@@ -126,6 +132,15 @@ func TestGatewayCompatibleHandlersPreservePartialUsage(t *testing.T) {
 				}
 				pool.Stop()
 				require.Equal(t, 1, upstream.calls, "no replay after a started or cancelled request")
+				if !clientStream {
+					if ending == "complete" {
+						require.Equal(t, http.StatusOK, recorder.Code)
+						require.Contains(t, recorder.Body.String(), "partial")
+					} else {
+						require.Equal(t, http.StatusBadGateway, recorder.Code, "a truncated upstream must not answer a buffered client with success; response=%s", recorder.Body.String())
+						require.NotContains(t, recorder.Body.String(), "partial")
+					}
+				}
 				usageRepo.mu.Lock()
 				defer usageRepo.mu.Unlock()
 				if ending == "before_start" {

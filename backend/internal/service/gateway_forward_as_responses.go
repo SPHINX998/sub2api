@@ -389,6 +389,7 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 	// Accumulate the final Anthropic response from streaming events
 	var finalResp *apicompat.AnthropicResponse
 	var usage ClaudeUsage
+	sawMessageStop := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -422,6 +423,9 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 			finalResp = event.Message
 			mergeAnthropicUsage(&usage, event.Message.Usage)
 		}
+		if event.Type == "message_stop" {
+			sawMessageStop = true
+		}
 
 		// message_delta carries final usage and stop_reason
 		if event.Type == "message_delta" {
@@ -454,13 +458,30 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	readErr := scanner.Err()
+	if readErr != nil {
+		if !errors.Is(readErr, context.Canceled) && !errors.Is(readErr, context.DeadlineExceeded) {
 			logger.L().Warn("forward_as_responses buffered: read error",
-				zap.Error(err),
+				zap.Error(readErr),
 				zap.String("request_id", requestID),
 			)
 		}
+	}
+	resultWithUsage := func() *ForwardResult {
+		return &ForwardResult{
+			RequestID:       requestID,
+			UpstreamHeaders: resp.Header,
+			Usage:           usage,
+			Model:           originalModel,
+			UpstreamModel:   mappedModel,
+			ReasoningEffort: reasoningEffort,
+			Stream:          false,
+			Duration:        time.Since(startTime),
+		}
+	}
+	if !sawMessageStop {
+		// 截断的上游不能把半截内容当成功返回；已计量的用量随错误带回入账。
+		return anthropicCompatBufferedIncomplete(c, writeResponsesError, resultWithUsage(), readErr)
 	}
 
 	if finalResp == nil {
@@ -505,16 +526,7 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 		c.JSON(http.StatusOK, responsesResp)
 	}
 
-	return &ForwardResult{
-		RequestID:       requestID,
-		UpstreamHeaders: resp.Header,
-		Usage:           usage,
-		Model:           originalModel,
-		UpstreamModel:   mappedModel,
-		ReasoningEffort: reasoningEffort,
-		Stream:          false,
-		Duration:        time.Since(startTime),
-	}, nil
+	return resultWithUsage(), nil
 }
 
 // handleResponsesStreamingResponse reads Anthropic SSE events from upstream,
@@ -773,6 +785,20 @@ func anthropicCompatIncompleteStream(c *gin.Context, result *ForwardResult, read
 	}
 	if !observed {
 		return nil, err
+	}
+	return result, err
+}
+
+// anthropicCompatBufferedIncomplete applies the same contract to the buffered
+// (non-streaming) compatibility responses. Nothing reached the client yet, so
+// the half-assembled answer is withheld: a failover leaves the response
+// untouched for the retry, anything else answers 502 in the endpoint's error
+// format while the metered usage still travels with the error.
+func anthropicCompatBufferedIncomplete(c *gin.Context, writeError func(*gin.Context, int, string, string), result *ForwardResult, readErr error) (*ForwardResult, error) {
+	result, err := anthropicCompatIncompleteStream(c, result, readErr)
+	var failoverErr *UpstreamFailoverError
+	if !errors.As(err, &failoverErr) {
+		writeError(c, http.StatusBadGateway, "server_error", "Upstream stream ended before the response completed")
 	}
 	return result, err
 }
